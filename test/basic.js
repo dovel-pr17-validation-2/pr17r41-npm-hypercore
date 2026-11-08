@@ -1,0 +1,1353 @@
+const test = require('brittle')
+const b4a = require('b4a')
+const HypercoreStorage = require('hypercore-storage')
+const crypto = require('hypercore-crypto')
+
+const Hypercore = require('../')
+const { create, createStorage, replicate, eventFlush } = require('./helpers')
+
+test('basic', async function (t) {
+  const core = await create(t)
+  let appends = 0
+
+  t.is(core.length, 0)
+  t.is(core.writable, true)
+  t.is(core.readable, true)
+
+  core.on('append', function () {
+    appends++
+  })
+
+  await core.append('hello')
+  t.is(core.length, 1)
+  await core.append('world')
+  t.is(core.length, 2)
+
+  const info = await core.info()
+
+  t.is(core.length, 2)
+  t.is(info.byteLength, 10)
+  t.is(appends, 2)
+})
+
+test('core id', async function (t) {
+  const key = b4a.alloc(32).fill('a')
+
+  const db = await createStorage(t)
+  const core = new Hypercore(db, key)
+
+  await core.ready()
+  t.is(core.id, 'cfosnambcfosnambcfosnambcfosnambcfosnambcfosnambcfoo')
+
+  await core.close()
+})
+
+test('session id', async function (t) {
+  const key = b4a.alloc(32).fill('a')
+
+  const db = await createStorage(t)
+  const core = new Hypercore(db, key)
+
+  const session = core.session()
+
+  await session.ready()
+  t.is(session.id, 'cfosnambcfosnambcfosnambcfosnambcfosnambcfosnambcfoo')
+
+  await core.close()
+  await session.close()
+})
+
+test('session', async function (t) {
+  const core = await create(t)
+
+  const session = core.session()
+
+  await session.append('test')
+  t.alike(await core.get(0), b4a.from('test'))
+  t.alike(await session.get(0), b4a.from('test'))
+
+  await session.close()
+})
+
+test('close', async function (t) {
+  const core = await create(t)
+  await core.append('hello world')
+
+  await core.close()
+
+  try {
+    await core.get(0)
+    t.fail('core should be closed')
+  } catch {
+    t.pass('get threw correctly when core was closed')
+  }
+})
+
+test('close multiple', async function (t) {
+  const core = await create(t)
+  await core.append('hello world')
+
+  const ev = t.test('events')
+
+  ev.plan(4)
+
+  let i = 0
+
+  core.on('close', () => ev.is(i++, 0, 'on close'))
+  core.close().then(() => ev.is(i++, 1, 'first close'))
+  core.close().then(() => ev.is(i++, 2, 'second close'))
+  core.close().then(() => ev.is(i++, 3, 'third close'))
+
+  await ev
+})
+
+test('storage options', async function (t) {
+  const db = await createStorage(t)
+  const core = new Hypercore({ storage: db })
+  await core.append('hello')
+  t.alike(await core.get(0), b4a.from('hello'))
+
+  await core.close()
+})
+
+test('createIfMissing', async function (t) {
+  const db = await createStorage(t)
+  const core = new Hypercore(db, { createIfMissing: false })
+
+  await t.exception(core.ready())
+  await db.close()
+})
+
+test('reopen writable core', async function (t) {
+  const dir = await t.tmp()
+
+  const core = new Hypercore(dir)
+  await core.ready()
+
+  let appends = 0
+
+  t.is(core.length, 0)
+  t.is(core.writable, true)
+  t.is(core.readable, true)
+
+  core.on('append', function () {
+    appends++
+  })
+
+  await core.append('hello')
+  await core.append('world')
+
+  const info = await core.info()
+
+  t.is(core.length, 2)
+  t.is(info.byteLength, 10)
+  t.is(appends, 2)
+
+  await core.close()
+
+  const core2 = new Hypercore(dir)
+  await core2.ready()
+
+  t.is(core2.length, 2)
+  t.is(core2.writable, true)
+  t.is(core2.readable, true)
+
+  core2.on('append', function () {
+    appends++
+  })
+
+  await core2.append('goodbye')
+  await core2.append('test')
+
+  t.is(core2.length, 4)
+  t.is(appends, 4)
+
+  await core2.close()
+})
+
+test('reopen and overwrite', async function (t) {
+  const dir = await t.tmp()
+  let storage = null
+
+  const core = new Hypercore(await open())
+
+  await core.ready()
+  await core.close()
+  const key = core.key
+
+  const reopen = new Hypercore(await open())
+
+  await reopen.ready()
+  t.alike(reopen.key, key, 'reopened the core')
+  await reopen.close()
+
+  const overwritten = new Hypercore(await open(), { overwrite: true })
+
+  await overwritten.ready()
+  t.unlike(overwritten.key, key, 'overwrote the core')
+
+  await overwritten.close()
+
+  async function open() {
+    if (storage) await storage.close()
+    storage = await createStorage(t, dir)
+    return storage
+  }
+})
+
+test('truncate event has truncated-length and fork', async function (t) {
+  t.plan(2)
+
+  const core = new Hypercore(await createStorage(t))
+
+  core.on('truncate', function (length, fork) {
+    t.is(length, 2)
+    t.is(fork, 1)
+  })
+
+  await core.append(['a', 'b', 'c'])
+  await core.truncate(2)
+  await core.close()
+})
+
+test('treeHash gets the tree hash at a given core length', async function (t) {
+  const core = new Hypercore(await createStorage(t))
+  await core.ready()
+
+  const {
+    core: { state }
+  } = core
+
+  const hashes = [state.hash()]
+
+  for (let i = 1; i < 10; i++) {
+    await core.append([`${i}`])
+    hashes.push(state.hash())
+  }
+
+  for (let i = 0; i < 10; i++) {
+    t.alike(await core.treeHash(i), hashes[i])
+  }
+
+  await core.close()
+})
+
+test('treeHash with default length', async function (t) {
+  const core = new Hypercore(await createStorage(t))
+  const core2 = new Hypercore(await createStorage(t))
+  await core.ready()
+  await core2.ready()
+
+  t.alike(await core.treeHash(), await core2.treeHash())
+
+  await core.append('a')
+
+  t.unlike(await core.treeHash(), await core2.treeHash())
+
+  await core.close()
+  await core2.close()
+})
+
+test('treeHashFromStorage() = treeHash()', async function (t) {
+  const core = await create(t)
+  await core.ready()
+
+  t.alike(await core.treeHash(), await Hypercore.treeHashFromStorage(core))
+
+  await core.append('a')
+
+  t.alike(await core.treeHash(), await Hypercore.treeHashFromStorage(core))
+
+  await core.close()
+})
+
+test('treeHashFromStorage() throws with bad storage', async function (t) {
+  const dir = await t.tmp()
+  const storage = await createStorage(t, dir)
+  const core = new Hypercore(storage)
+  t.teardown(() => core.close(), { order: 1 })
+  await core.ready()
+  await core.append('a')
+
+  const batch = core.session({ name: 'batch' })
+
+  await batch.state.mutex.lock()
+  const tx = batch.state.storage.write()
+  // Set a nonsense dependency to force all tree nodes to fail
+  tx.setDependency({
+    dataPointer: 1337,
+    length: 3
+  })
+  const flushed = await tx.flush()
+  batch.state._unlock()
+  await core.close()
+  await storage.close()
+
+  t.ok(flushed, 'storage corrupted')
+
+  const storage2 = await createStorage(t, dir)
+  const core2 = new Hypercore(storage2)
+  t.teardown(() => core2.close(), { order: 1 })
+  await core2.ready()
+  const batch2 = core2.session({ name: 'batch' })
+  await batch2.ready() // ensure the session is resumed
+
+  t.exception(Hypercore.treeHashFromStorage(batch2), /INVALID_OPERATION: Expected tree node/)
+
+  await core2.close()
+  await storage2.close()
+})
+
+test('snapshot locks the state', async function (t) {
+  const core = new Hypercore(await createStorage(t))
+  await core.ready()
+
+  const a = core.snapshot()
+
+  await core.append('a')
+
+  t.is(a.length, 0)
+  t.is(core.length, 1)
+
+  const b = core.snapshot()
+
+  await core.append('c')
+
+  t.is(a.length, 0)
+  t.is(b.length, 1)
+
+  await core.close()
+  await a.close()
+  await b.close()
+})
+
+test('downloading local range', async function (t) {
+  t.plan(1)
+
+  const core = new Hypercore(await createStorage(t))
+
+  await core.append('a')
+
+  const range = core.download({ start: 0, end: 1 })
+
+  await eventFlush()
+
+  await range.destroy()
+
+  t.pass('did not throw')
+
+  await core.close()
+})
+
+test('read ahead', async function (t) {
+  t.plan(7)
+
+  const core = new Hypercore(await createStorage(t), {
+    valueEncoding: 'utf-8',
+    onwait: () => {
+      t.is(core.waits, 1, 'waits correct in onwait on core')
+      t.pass('onwait on core called')
+    }
+  })
+
+  await core.append('a')
+
+  t.is(core.waits, 0, 'no waits yet')
+  const blk = core.get(1, {
+    wait: true,
+    onwait: () => {
+      t.is(core.waits, 1, 'waits correct in onwait on get')
+      t.pass('onwait on get called')
+    }
+  }) // readahead
+
+  await eventFlush()
+
+  await core.append('b')
+  t.is(core.waits, 1, 'waiting for block')
+
+  t.alike(await blk, 'b')
+
+  await core.close()
+})
+
+test('defaults for wait', async function (t) {
+  t.plan(10)
+
+  const core = new Hypercore(await createStorage(t), b4a.alloc(32), { valueEncoding: 'utf-8' })
+
+  const a = core.get(1)
+
+  a.catch(function (err) {
+    t.ok(err, 'a failed')
+  })
+
+  t.is(await core.get(1, { wait: false }), null)
+
+  const s = core.session({ wait: false })
+
+  t.is(s.waits, 0, 'no waits yet')
+  let _resolveWait
+  const waited = new Promise((resolve) => {
+    _resolveWait = resolve
+  })
+  const b = s.get(1, { wait: true, onwait: () => _resolveWait() })
+
+  b.catch(function (err) {
+    t.is(s.waits, 1, 'waits increment')
+    t.ok(err, 'b failed')
+  })
+
+  await waited // Ensure that the request has started waiting
+
+  t.is(await s.get(1), null)
+  t.is(s.waits, 1, 'waits stays the same when no waiting')
+
+  const s2 = s.session() // check if wait is inherited
+
+  t.is(s2.waits, 0, 'sessions have unique waits')
+  t.is(await s2.get(1), null)
+  t.is(s2.waits, 0, 'session didnt wait')
+
+  await s.close()
+  await s2.close()
+  await core.close()
+})
+
+test('has', async function (t) {
+  const core = await create(t)
+  await core.append(['a', 'b', 'c', 'd', 'e', 'f'])
+
+  for (let i = 0; i < core.length; i++) {
+    t.ok(await core.has(i), `has ${i}`)
+  }
+
+  await core.clear(2)
+  t.comment('2 cleared')
+
+  for (let i = 0; i < core.length; i++) {
+    if (i === 2) {
+      t.absent(await core.has(i), `does not have ${i}`)
+    } else {
+      t.ok(await core.has(i), `has ${i}`)
+    }
+  }
+
+  await core.close()
+})
+
+test('has range', async function (t) {
+  const core = await create(t)
+  await core.append(['a', 'b', 'c', 'd', 'e', 'f'])
+
+  t.ok(await core.has(0, 5), 'has 0 to 4')
+
+  await core.clear(2)
+  t.comment('2 cleared')
+
+  t.absent(await core.has(0, 5), 'does not have 0 to 4')
+  t.ok(await core.has(0, 2), 'has 0 to 1')
+  t.ok(await core.has(3, 5), 'has 3 to 4')
+
+  await core.close()
+})
+
+test('count', async function (t) {
+  const core = await create(t)
+  await core.append(['a', 'b', 'c', 'd', 'e', 'f'])
+
+  t.is(await core.count(0, 6), 6)
+
+  await core.clear(2, 4)
+  t.comment('2 to 3 cleared')
+
+  t.is(await core.count(0, 6), 4)
+  t.is(await core.count(0, 2), 2)
+  t.is(await core.count(2, 4), 0)
+
+  await core.close()
+})
+
+test('count past length', async function (t) {
+  const core = await create(t)
+  await core.append(['a', 'b', 'c'])
+
+  t.is(await core.count(0, 10), 3)
+  t.is(await core.count(5, 10), 0)
+
+  await core.close()
+})
+
+test('count invalid range', async function (t) {
+  const core = await create(t)
+  await core.append(['a', 'b', 'c'])
+
+  await t.exception(core.count(-1, 2), /count range is invalid/)
+  t.is(await core.count(1, 1), 0)
+
+  await core.close()
+})
+
+test('count sparse replica', async function (t) {
+  const a = await create(t)
+  await a.append(['a', 'b', 'c', 'd', 'e', 'f'])
+
+  const b = await create(t, a.key)
+  replicate(a, b, t)
+
+  await b.download({ start: 1, end: 4 }).done()
+
+  t.is(await b.count(0, 6), 3)
+  t.is(await b.count(1, 4), 3)
+  t.is(await b.count(4, 6), 0)
+
+  await a.close()
+  await b.close()
+})
+
+test('count named session', async function (t) {
+  const core = await create(t)
+  await core.append(['a', 'b', 'c', 'd'])
+
+  const named = core.session({ name: 'named' })
+  await named.ready()
+  await named.append(['e', 'f'])
+
+  t.is(await named.count(0, 6), 6)
+  t.is(await core.count(0, 6), 4)
+
+  await named.close()
+  await core.close()
+})
+
+test.skip('storage info', async function (t) {
+  const core = await create(t)
+  await core.append(['a', 'b', 'c', 'd', 'e', 'f'])
+
+  const info = await core.info({ storage: true })
+
+  t.snapshot(info.storage)
+
+  await core.close()
+})
+
+test('storage info, off by default', async function (t) {
+  const core = await create(t)
+  await core.append(['a', 'b', 'c', 'd', 'e', 'f'])
+
+  const info = await core.info()
+
+  t.is(info.storage, null)
+
+  await core.close()
+})
+
+test('signedLength mirrors core length (linearised core compat)', async function (t) {
+  const core = await create(t)
+  t.is(core.length, 0)
+  t.is(core.signedLength, core.length)
+
+  await core.append(['a', 'b'])
+  t.is(core.length, 2)
+  t.is(core.signedLength, core.length)
+
+  await core.close()
+})
+
+test('key is set sync', async function (t) {
+  const key = b4a.from('a'.repeat(64), 'hex')
+
+  const dir1 = await createStorage(t)
+  const dir2 = await createStorage(t)
+  const dir3 = await createStorage(t)
+  const dir4 = await createStorage(t)
+
+  const core1 = new Hypercore(dir1, key)
+  const core2 = new Hypercore(dir2)
+  const core3 = new Hypercore(dir3, { key })
+  const core4 = new Hypercore(dir4, {})
+
+  // flush all db ops before teardown
+  t.teardown(() => core1.close())
+  t.teardown(() => core2.close())
+  t.teardown(() => core3.close())
+  t.teardown(() => core4.close())
+
+  t.alike(core1.key, key)
+  t.is(core2.key, null)
+  t.alike(core3.key, key)
+  t.is(core4.key, null)
+})
+
+test('disable writable option', async function (t) {
+  t.plan(2)
+
+  const core = new Hypercore(await createStorage(t), { writable: false })
+  await core.ready()
+
+  t.is(core.writable, false)
+
+  try {
+    await core.append('abc')
+    t.fail('should have failed')
+  } catch (err) {
+    t.pass(err.code, 'SESSION_NOT_WRITABLE')
+  }
+
+  await core.close()
+})
+
+test('disable session writable option', async function (t) {
+  t.plan(3)
+
+  const core = new Hypercore(await createStorage(t))
+  await core.ready()
+
+  const session = core.session({ writable: false })
+  await session.ready()
+
+  t.is(core.writable, true)
+  await core.append('abc')
+
+  t.is(session.writable, false)
+  try {
+    await session.append('abc')
+    t.fail('should have failed')
+  } catch (err) {
+    t.pass(err.code, 'SESSION_NOT_WRITABLE')
+  }
+
+  await session.close()
+  await core.close()
+})
+
+test('session of a session with the writable option disabled', async function (t) {
+  t.plan(1)
+
+  const core = new Hypercore(await createStorage(t))
+  const s1 = core.session({ writable: false })
+  const s2 = s1.session()
+
+  try {
+    await s2.append('abc')
+    t.fail('should have failed')
+  } catch (err) {
+    t.pass(err.code, 'SESSION_NOT_WRITABLE')
+  }
+
+  await s1.close()
+  await s2.close()
+  await core.close()
+})
+
+test('writable session on a readable only core', async function (t) {
+  t.plan(2)
+
+  const core = new Hypercore(await createStorage(t))
+  await core.ready()
+
+  const a = new Hypercore(await createStorage(t), core.key)
+  const s = a.session({ writable: true })
+  await s.ready()
+  t.is(s.writable, false)
+
+  try {
+    await s.append('abc')
+    t.fail('should have failed')
+  } catch (err) {
+    t.pass(err.code, 'SESSION_NOT_WRITABLE')
+  }
+
+  await s.close()
+  await a.close()
+  await core.close()
+})
+
+test('append above the max suggested block size', async function (t) {
+  t.plan(1)
+
+  const core = new Hypercore(await createStorage(t))
+
+  try {
+    await core.append(Buffer.alloc(Hypercore.MAX_SUGGESTED_BLOCK_SIZE))
+  } catch (e) {
+    t.fail('should not throw')
+  }
+
+  try {
+    await core.append(Buffer.alloc(Hypercore.MAX_SUGGESTED_BLOCK_SIZE + 1))
+  } catch {
+    t.pass('should throw')
+  }
+
+  await core.close()
+})
+
+test('get undefined block is not allowed', async function (t) {
+  t.plan(1)
+
+  const core = new Hypercore(await createStorage(t))
+
+  try {
+    await core.get(undefined)
+    t.fail()
+  } catch (err) {
+    t.pass(err.code, 'ERR_ASSERTION')
+  }
+
+  await core.close()
+})
+
+test('valid manifest passed to a session is stored', async function (t) {
+  t.plan(1)
+
+  const core = new Hypercore(await createStorage(t), {
+    manifest: {
+      prologue: {
+        hash: b4a.alloc(32),
+        length: 1
+      },
+      signers: []
+    }
+  })
+
+  await core.ready()
+
+  const a = new Hypercore(await createStorage(t), core.key)
+  const b = new Hypercore(null, core.key, { manifest: core.manifest, core: a.core })
+
+  await b.ready()
+
+  t.alike(b.manifest, core.manifest)
+
+  await a.close()
+  await b.close()
+  await core.close()
+})
+
+test('exclusive sessions', async function (t) {
+  const core = new Hypercore(await createStorage(t))
+
+  const a = core.session({ exclusive: true })
+  await a.ready()
+
+  setTimeout(() => a.close(), 200)
+
+  const b = core.session({ exclusive: true })
+  await b.ready()
+  t.ok(a.closed)
+  await b.close()
+
+  await core.close()
+})
+
+test('truncate has correct storage state in memory and persisted', async function (t) {
+  const tmpDir = await t.tmp()
+  {
+    const storage = new HypercoreStorage(tmpDir)
+    const core = new Hypercore(storage)
+    await core.append(['a', 'b', 'c', 'd', 'e'])
+    await core.truncate(2)
+    t.alike(getBitfields(core, 0, 5), [true, true, false, false, false])
+    t.is(core.contiguousLength, 2)
+    t.is(core.core.header.hints.contiguousLength, 2)
+    t.is(await getContiguousLengthInStorage(core), 2)
+    await core.close()
+  }
+
+  {
+    const storage = new HypercoreStorage(tmpDir)
+    const core = new Hypercore(storage)
+    await core.ready()
+    t.alike(getBitfields(core, 0, 5), [true, true, false, false, false])
+    t.is(core.contiguousLength, 2)
+    t.is(core.core.header.hints.contiguousLength, 2)
+    t.is(await getContiguousLengthInStorage(core), 2)
+    await core.close()
+  }
+})
+
+test('clear has correct storage state in memory and persisted', async function (t) {
+  const tmpDir = await t.tmp()
+  {
+    const storage = new HypercoreStorage(tmpDir)
+    const core = new Hypercore(storage)
+    await core.append(['a', 'b', 'c', 'd', 'e'])
+    await core.clear(2)
+    t.alike(getBitfields(core, 0, 5), [true, true, false, true, true])
+    t.is(core.contiguousLength, 2)
+    t.is(core.core.header.hints.contiguousLength, 2)
+    t.is(await getContiguousLengthInStorage(core), 2)
+    await core.close()
+  }
+
+  {
+    const storage = new HypercoreStorage(tmpDir)
+    const core = new Hypercore(storage)
+    await core.ready()
+    t.alike(getBitfields(core, 0, 5), [true, true, false, true, true])
+    t.is(core.contiguousLength, 2)
+    t.is(core.core.header.hints.contiguousLength, 2)
+    t.is(await getContiguousLengthInStorage(core), 2)
+    await core.close()
+  }
+})
+
+test('contiguousLength 0 for in-memory view after core ready', async function (t) {
+  const tmpDir = await t.tmp()
+  {
+    const storage = new HypercoreStorage(tmpDir)
+    const core = new Hypercore(storage)
+    await core.ready()
+    t.is(core.contiguousLength, 0)
+    t.is(core.core.header.hints.contiguousLength, 0)
+    await core.close()
+  }
+
+  {
+    const storage = new HypercoreStorage(tmpDir)
+    const core = new Hypercore(storage)
+    await core.ready()
+    t.is(core.contiguousLength, 0)
+    t.is(core.core.header.hints.contiguousLength, 0)
+    await core.close()
+  }
+})
+
+test('contiguousLength gets updated after an append (also on disk)', async function (t) {
+  const tmpDir = await t.tmp()
+  {
+    const storage = new HypercoreStorage(tmpDir)
+    const core = new Hypercore(storage)
+    await core.append(['a', 'b', 'c', 'd', 'e'])
+    t.alike(getBitfields(core, 0, 5), [true, true, true, true, true])
+    t.is(core.contiguousLength, 5)
+    t.is(core.core.header.hints.contiguousLength, 5)
+    t.is(await getContiguousLengthInStorage(core), 5)
+    await core.close()
+  }
+
+  {
+    const storage = new HypercoreStorage(tmpDir)
+    const core = new Hypercore(storage)
+    await core.ready()
+    t.alike(getBitfields(core, 0, 5), [true, true, true, true, true])
+    t.is(core.contiguousLength, 5)
+    t.is(core.core.header.hints.contiguousLength, 5)
+    t.is(await getContiguousLengthInStorage(core), 5)
+
+    await core.append(['f', 'g'])
+    t.alike(getBitfields(core, 0, 8), [true, true, true, true, true, true, true, false])
+    t.is(core.contiguousLength, 7)
+    t.is(core.core.header.hints.contiguousLength, 7)
+    t.is(await getContiguousLengthInStorage(core), 7)
+
+    await core.clear(4)
+    t.alike(getBitfields(core, 0, 8), [true, true, true, true, false, true, true, false])
+    t.is(core.contiguousLength, 4)
+    t.is(core.core.header.hints.contiguousLength, 4)
+    t.is(await getContiguousLengthInStorage(core), 4)
+
+    await core.append(['h'])
+    t.alike(getBitfields(core, 0, 8), [true, true, true, true, false, true, true, true])
+    t.is(core.contiguousLength, 4)
+    t.is(core.core.header.hints.contiguousLength, 4)
+    t.is(await getContiguousLengthInStorage(core), 4)
+
+    await core.close()
+  }
+
+  {
+    const storage = new HypercoreStorage(tmpDir)
+    const core = new Hypercore(storage)
+    await core.ready()
+    t.alike(getBitfields(core, 0, 8), [true, true, true, true, false, true, true, true])
+    t.is(core.contiguousLength, 4)
+    t.is(core.core.header.hints.contiguousLength, 4)
+    t.is(await getContiguousLengthInStorage(core), 4)
+    await core.close()
+  }
+})
+
+test('append alignment to bitfield boundary', async function (t) {
+  const tmpDir = await t.tmp()
+
+  const expectedBitfields = new Array(32768)
+  expectedBitfields.fill(true)
+  expectedBitfields.push(false)
+
+  {
+    const storage = new HypercoreStorage(tmpDir)
+    const core = new Hypercore(storage)
+    await core.ready()
+
+    const b = []
+    for (let i = 0; i < 32768; i++) {
+      b.push('#')
+    }
+
+    await core.append(b)
+
+    t.alike(getBitfields(core, 0, 32769), expectedBitfields)
+    t.is(core.contiguousLength, 32768)
+    t.is(core.core.header.hints.contiguousLength, 32768)
+
+    await core.close()
+  }
+
+  {
+    const storage = new HypercoreStorage(tmpDir)
+    const core = new Hypercore(storage)
+    await core.ready()
+
+    t.alike(getBitfields(core, 0, 32769), expectedBitfields)
+    t.is(core.contiguousLength, 32768)
+    t.is(core.core.header.hints.contiguousLength, 32768)
+
+    await core.close()
+  }
+})
+
+test('setKeyPair', async function (t) {
+  const core = await create(t)
+
+  await core.append('hello')
+  t.is(core.length, 1)
+
+  const keyPair = crypto.keyPair()
+  t.unlike(core.keyPair, keyPair, 'generate new keyPair')
+  core.setKeyPair(keyPair)
+  t.alike(core.keyPair, keyPair, 'keyPair updated')
+
+  await t.exception(core.append('world'), /Public key is not a declared signer/)
+})
+
+test('setAlwaysLatestBlock()', async (t) => {
+  const core = await create(t)
+
+  t.is(core.replicator._alwaysLatestBlock, 0, 'default is disabled')
+
+  await core.setAlwaysLatestBlock(true)
+
+  t.is(core.replicator._alwaysLatestBlock, 1, 'passing true enables')
+
+  await core.setAlwaysLatestBlock(true)
+  t.is(core.replicator._alwaysLatestBlock, 1, 'passing true while enabled noop')
+
+  await core.setAlwaysLatestBlock(1)
+  t.is(core.replicator._alwaysLatestBlock, 1, 'passing 1 doesnt circumvent noop test')
+
+  await core.setAlwaysLatestBlock(false)
+  t.is(core.replicator._alwaysLatestBlock, 0, 'passing false can disable')
+
+  await core.setAlwaysLatestBlock(false)
+  t.is(core.replicator._alwaysLatestBlock, 0, 'passing false while disabled noop')
+
+  // With end = -1 range request
+  const range = core.download({ start: 0, end: -1 })
+  t.is(core.replicator._alwaysLatestBlock, 1, 'range req (end = -1) incremented')
+
+  await core.setAlwaysLatestBlock(true)
+  t.is(core.replicator._alwaysLatestBlock, 2, 'passing true increments when 1 from range')
+
+  await core.setAlwaysLatestBlock(true)
+  t.is(core.replicator._alwaysLatestBlock, 2, 'passing true doesnt over increment')
+
+  range.destroy()
+  t.is(core.replicator._alwaysLatestBlock, 1, 'range done/cancelled dec')
+
+  await core.setAlwaysLatestBlock(false)
+  t.is(core.replicator._alwaysLatestBlock, 0, 'passing false disables again')
+
+  const db = await createStorage(t)
+  // Create core w/ microtask in opening so `.core` isn't set
+  const notReady = new Hypercore(db, { preload: () => Promise.resolve({}) })
+  t.teardown(() => notReady.close())
+
+  await t.execution(
+    () => notReady.setAlwaysLatestBlock(true),
+    'calling on not ready core doesnt throw'
+  )
+  await notReady.ready()
+  t.is(notReady.replicator._alwaysLatestBlock, 1, 'call still took affect')
+})
+
+function getBitfields(hypercore, start = 0, end = null) {
+  if (!end) end = hypercore.length
+
+  const res = []
+  for (let i = start; i < end; i++) {
+    res.push(hypercore.core.bitfield.get(i))
+  }
+
+  return res
+}
+
+async function getContiguousLengthInStorage(hypercore) {
+  const storageRx = hypercore.core.storage.read()
+  const [res] = await Promise.all([storageRx.getHints(), storageRx.tryFlush()])
+  return res === null ? null : res.contiguousLength
+}
+
+test('apply full proofs per block, no replication', async function (t) {
+  const a = await create(t)
+  const b = await create(t, a.key)
+
+  for (let i = 0; i < 20; i++) {
+    await a.append('block-' + i)
+
+    const proof = await a.proof({
+      block: { index: i, nodes: 0, value: true },
+      upgrade: { start: 0, length: i + 1 }
+    })
+    proof.manifest = a.manifest
+
+    t.ok(await b.applyProof(proof), 'applied proof for block ' + i)
+    t.is(b.length, i + 1)
+  }
+
+  t.is(b.length, a.length)
+  t.alike(await b.treeHash(), await a.treeHash())
+  t.is(b.contiguousLength, 20)
+
+  for (let i = 0; i < 20; i++) {
+    t.ok(await b.has(i), 'has block ' + i)
+    t.alike(await b.get(i, { wait: false }), b4a.from('block-' + i))
+  }
+})
+
+test('apply full proofs per block in reverse order, no replication', async function (t) {
+  const a = await create(t)
+  const b = await create(t, a.key)
+
+  const proofs = []
+
+  for (let i = 0; i < 20; i++) {
+    await a.append('block-' + i)
+
+    const proof = await a.proof({
+      block: { index: i, nodes: 0, value: true },
+      upgrade: { start: 0, length: i + 1 }
+    })
+    proof.manifest = a.manifest
+    proofs.push(proof)
+  }
+
+  for (let i = 19; i >= 0; i--) {
+    t.ok(await b.applyProof(proofs[i]), 'applied proof for block ' + i)
+    t.is(b.length, 20)
+  }
+
+  t.alike(await b.treeHash(), await a.treeHash())
+  t.is(b.contiguousLength, 20)
+
+  for (let i = 0; i < 20; i++) {
+    t.ok(await b.has(i), 'has block ' + i)
+    t.alike(await b.get(i, { wait: false }), b4a.from('block-' + i))
+  }
+})
+
+test('stateless batch proofs apply in any order', async function (t) {
+  const a = await create(t)
+  for (let i = 0; i < 18; i++) await a.append('block-' + i)
+
+  const base = await a.proof({ upgrade: { start: 0, length: 18 } })
+  base.manifest = a.manifest
+
+  await a.append(['block-18', 'block-19', 'block-20', 'block-21'])
+
+  const proofs = []
+  for (let i = 18; i < 22; i++) {
+    const proof = await a.proof({
+      block: { index: i, nodes: 0, value: true },
+      upgrade: { start: 0, length: 18 }
+    })
+    proof.manifest = a.manifest
+    proofs.push(proof)
+  }
+
+  for (const order of permutations([0, 1, 2, 3])) {
+    const b = await create(t, a.key)
+    await b.applyProof(base)
+    t.is(b.length, 18)
+
+    for (const i of order) {
+      t.ok(await b.applyProof(proofs[i]), 'applied ' + (18 + i) + ' in ' + order)
+    }
+
+    t.is(b.length, 22)
+    for (let i = 18; i < 22; i++) t.alike(await b.get(i, { wait: false }), b4a.from('block-' + i))
+    await b.close()
+  }
+
+  for (let n = 0; n < 2; n++) {
+    const empty = await create(t, a.key)
+    t.ok(await empty.applyProof(proofs[2]), 'same proof applied to empty receiver ' + n)
+    t.is(empty.length, 22)
+    t.alike(await empty.get(20, { wait: false }), b4a.from('block-20'))
+  }
+})
+
+test('zero length upgrade is rejected', async function (t) {
+  const a = await create(t)
+  const b = await create(t, a.key)
+
+  const proof = {
+    fork: 0,
+    block: null,
+    hash: null,
+    seek: null,
+    upgrade: { start: 0, length: 0, nodes: [], additionalNodes: [], signature: b4a.alloc(64) },
+    manifest: null
+  }
+
+  await t.exception(b.applyProof(proof), /INVALID_OPERATION/)
+  await t.exception(b.verifyFullyRemote(proof), /INVALID_OPERATION/)
+})
+
+test('proof reports the length it upgrades a receiver to', async function (t) {
+  // the replicator records coreLength as the peer's pushedLength
+  for (const [blocks, upgrade] of [
+    [22, 18],
+    [20, 16]
+  ]) {
+    const a = await create(t)
+    for (let i = 0; i < blocks; i++) await a.append('block-' + i)
+
+    for (let i = upgrade; i < blocks; i++) {
+      const proof = await a.proof({
+        block: { index: i, nodes: 0, value: true },
+        upgrade: { start: 0, length: upgrade }
+      })
+      proof.manifest = a.manifest
+
+      const b = await create(t, a.key)
+      t.ok(await b.applyProof(proof), 'applied proof for block ' + i + ' of ' + blocks)
+
+      t.is(
+        proof.coreLength,
+        b.length,
+        'coreLength matches the length the proof upgraded to (block ' + i + ' of ' + blocks + ')'
+      )
+
+      await b.close()
+    }
+
+    await a.close()
+  }
+})
+
+test('a proof that refit cannot bridge is rejected, not treated as invalid', async function (t) {
+  const a = await create(t)
+
+  // a base proof per length, captured while a is at that length so it conveys
+  // exactly that many blocks
+  const bases = [null]
+  for (let i = 0; i < 12; i++) {
+    await a.append('block-' + i)
+    const base = await a.proof({ upgrade: { start: 0, length: i + 1 } })
+    base.manifest = a.manifest
+    bases.push(base)
+  }
+
+  // a proof for block 1 as a peer at length 1 would request it. it deliberately
+  // omits everything below length 1, so once our length moves on there is
+  // nothing left for refit() to rebuild it from
+  const proof = await a.proof({
+    block: { index: 1, nodes: 0, value: true },
+    upgrade: { start: 1, length: 11 }
+  })
+  proof.manifest = a.manifest
+
+  // the length grew from 1 to 2 while the proof was in flight
+  const b = await create(t, a.key)
+  await b.applyProof(bases[2])
+  t.is(b.length, 2)
+
+  t.is(await b.applyProof(proof), false, 'proof did not apply')
+  t.is(b.length, 2, 'length is untouched')
+  t.absent(await b.has(1), 'block was not stored')
+})
+
+test('refit declines unbridgeable proofs but still rejects malformed ones', async function (t) {
+  const a = await create(t)
+
+  const bases = [null]
+  for (let i = 0; i < 12; i++) {
+    await a.append('block-' + i)
+    const base = await a.proof({ upgrade: { start: 0, length: i + 1 } })
+    base.manifest = a.manifest
+    bases.push(base)
+  }
+
+  // a proof for block 4 as a peer at length 1 would request it. the nodes it
+  // carries can be refit from length 4, but not from length 3
+  async function proof() {
+    const p = await a.proof({
+      block: { index: 4, nodes: 0, value: true },
+      upgrade: { start: 1, length: 11 }
+    })
+    p.manifest = a.manifest
+    return p
+  }
+
+  async function receiver(length) {
+    const b = await create(t, a.key)
+    await b.applyProof(bases[length])
+    t.is(b.length, length, 'receiver is at ' + length)
+    return b
+  }
+
+  // valid, but it raced us past a length its nodes can bridge. declined, not punished
+  {
+    const b = await receiver(3)
+    t.is(await b.applyProof(await proof()), false, 'unbridgeable proof declined')
+    t.is(b.length, 3, 'length is untouched')
+    await b.close()
+  }
+
+  // unbridgeable too, but the node list does not line up.
+  {
+    const b = await receiver(3)
+    const p = await proof()
+    p.block.nodes[0] = { ...p.block.nodes[0], index: p.block.nodes[0].index + 2 }
+
+    await t.exception(b.applyProof(p), /INVALID_OPERATION/, 'malformed proof throws')
+    t.is(b.length, 3, 'length is untouched')
+    await b.close()
+  }
+
+  // from a length it can bridge, the same proof applies
+  {
+    const b = await receiver(4)
+    t.is(await b.applyProof(await proof()), true, 'bridgeable proof applied')
+    t.is(b.length, 12, 'upgraded to the senders length')
+    t.alike(await b.get(4, { wait: false }), b4a.from('block-4'))
+    await b.close()
+  }
+
+  // ... and refit cannot launder a corrupted node into a valid tree
+  {
+    const b = await receiver(4)
+    const p = await proof()
+    const node = p.block.nodes[0]
+    p.block.nodes[0] = { index: node.index, size: node.size, hash: b4a.alloc(32) }
+
+    await t.exception(b.applyProof(p), /INVALID_SIGNATURE/, 'corrupted proof throws')
+    t.is(b.length, 4, 'length is untouched')
+    await b.close()
+  }
+})
+
+test('refit rejects a proof with more nodes than any tree has', async function (t) {
+  const a = await create(t)
+  for (let i = 0; i < 4; i++) await a.append('block-' + i)
+
+  const b = await create(t, a.key)
+
+  const proof = await a.proof({ upgrade: { start: 1, length: 3 } })
+  proof.manifest = a.manifest
+  while (proof.upgrade.additionalNodes.length <= 2 * 64) {
+    proof.upgrade.additionalNodes.push(proof.upgrade.nodes[0])
+  }
+
+  await t.exception(b.applyProof(proof), /INVALID_OPERATION/)
+})
+
+test('a fork landing while a proof refits does not rewind the fork', async function (t) {
+  const a = await create(t)
+  for (let i = 0; i < 8; i++) await a.append('block-' + i)
+
+  // captured while a is at length 8, so it conveys exactly 8 blocks
+  const base = await a.proof({ upgrade: { start: 0, length: 8 } })
+  base.manifest = a.manifest
+
+  for (let i = 8; i < 12; i++) await a.append('block-' + i)
+
+  // a fork 0 proof that needs a refit at length 8. block 2 sits inside the length 8
+  // tree, so the refit has to read from storage and yields while it does
+  const stale = await a.proof({
+    block: { index: 2, nodes: 0, value: true },
+    upgrade: { start: 0, length: 12 }
+  })
+  stale.manifest = a.manifest
+
+  // a signature for (hash at 8, length 8, fork 1). same key and same blocks, truncated
+  // to the length it is already at, so the fork moves but the tree does not
+  const a2 = await create(t, { keyPair: a.keyPair })
+  for (let i = 0; i < 8; i++) await a2.append('block-' + i)
+  await a2.truncate(8, { fork: 1 })
+
+  const b = await create(t, a.key)
+  await b.applyProof(base)
+  t.is(b.fork, 0)
+  t.is(b.length, 8)
+
+  // the fork commits while the proof is refitting, so the refit describes a tree we no
+  // longer have. commitable() cannot catch that, it samples the fork afterwards, and the
+  // signature cannot either since the tree is unchanged, so verify has to recheck itself
+  const forking = b.truncate(8, { fork: 1, signature: a2.state.signature })
+  const applying = b.applyProof(stale)
+
+  await forking
+
+  t.is(await applying, false, 'stale proof did not apply')
+  t.is(b.fork, 1, 'fork was not rewound')
+  t.is(b.length, 8, 'length is untouched')
+  t.absent(await b.has(2), 'block was not stored')
+})
+
+test('refit rejects a block index past what a tree can address', async function (t) {
+  const a = await create(t)
+  const b = await create(t, a.key)
+
+  const proof = {
+    fork: 0,
+    block: { index: 2 ** 52, value: b4a.from('x'), nodes: [] },
+    hash: null,
+    seek: null,
+    upgrade: { start: 1, length: 1, nodes: [], additionalNodes: [], signature: b4a.alloc(64) },
+    manifest: null
+  }
+
+  await t.exception(b.applyProof(proof), /INVALID_OPERATION/)
+})
+
+test('concurrent gets of a local block share one storage read', async function (t) {
+  const core = await create(t)
+  await core.append(['a', 'b', 'c'])
+
+  const reads = []
+  for (let i = 0; i < 10; i++) reads.push(core.get(1))
+
+  // get() yields once before it reads, so the reads are in flight after a tick
+  await new Promise((resolve) => setImmediate(resolve))
+  t.is(core.state.reads.size, 1, 'one read in flight for the block')
+
+  const blocks = await Promise.all(reads)
+  for (const b of blocks) t.alike(b, b4a.from('b'))
+
+  t.is(core.state.reads.size, 0, 'nothing in flight once settled')
+})
+
+test('a read of a missing block is not cached beyond its settle', async function (t) {
+  const core = await create(t)
+  await core.append('a')
+
+  const missing = await core.get(5, { wait: false })
+  t.is(missing, null)
+  t.is(core.state.reads.size, 0)
+
+  await core.append(['b', 'c', 'd', 'e', 'f'])
+  t.alike(await core.get(5), b4a.from('f'))
+})
+
+function permutations(items) {
+  if (items.length <= 1) return [items]
+  const result = []
+  for (let i = 0; i < items.length; i++) {
+    const rest = items.slice(0, i).concat(items.slice(i + 1))
+    for (const perm of permutations(rest)) result.push([items[i], ...perm])
+  }
+  return result
+}

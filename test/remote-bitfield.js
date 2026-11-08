@@ -1,0 +1,229 @@
+const test = require('brittle')
+const b4a = require('b4a')
+const RemoteBitfield = require('../lib/remote-bitfield')
+const { create, replicate, eventFlush } = require('./helpers')
+
+test('remote bitfield - findFirst', function (t) {
+  const b = new RemoteBitfield()
+
+  b.set(1000000, true)
+
+  t.is(b.findFirst(true, 0), 1000000)
+})
+
+test('remote bitfield - set range on page boundary', function (t) {
+  const b = new RemoteBitfield()
+
+  b.setRange(2032, 2058, true)
+
+  t.is(b.findFirst(true, 2048), 2048)
+})
+
+test('remote bitfield - findFirst(false) past the last page never returns less than the position', function (t) {
+  const b = new RemoteBitfield()
+
+  b.set(10, true) // only the first page exists
+
+  t.is(b.findFirst(false, 100000), 100000)
+  t.is(b.firstUnset(40000), 40000)
+})
+
+test('remote bitfield - set range to false', function (t) {
+  const b = new RemoteBitfield()
+
+  b.set(1000, true) // Something to overwrite
+  b.set(5001, true) // Something to remain
+
+  b.setRange(0, 5000, false)
+
+  t.is(b.findFirst(true, 0), 5001, 'cleared bit in range')
+})
+
+test('remote bitfield - findLast', function (t) {
+  const b = new RemoteBitfield()
+
+  const start = Date.now()
+  t.is(b.findLast(true, 2 ** 53), -1, 'cant find last starting large index in empty bitfield')
+  const delta = Date.now() - start
+  t.comment('delta for findLast w/ large start', delta)
+  t.ok(delta < 100, 'was "fast" (< 100ms)')
+})
+
+test('set last bits in segment and findFirst', function (t) {
+  const b = new RemoteBitfield()
+
+  b.set(32766, true)
+  t.is(b.findFirst(false, 32766), 32767)
+
+  b.set(32767, true)
+  t.is(b.findFirst(false, 32766), 32768)
+  t.is(b.findFirst(false, 32767), 32768)
+})
+
+test('clear', function (t) {
+  const b = new RemoteBitfield()
+
+  t.is(b._maxSegments, 0, 'starts empty')
+  b.clear(0, b4a.alloc(32768 / 8).fill(255))
+  t.is(b._maxSegments, 0, 'doesnt allocate page/segment if not there')
+
+  // Clears range
+  t.absent(b.get(7), 'no bit')
+  b.setRange(0, 16, true)
+  t.ok(b.get(7), 'set range')
+
+  const clearBuffer = b4a.alloc(4, 0)
+  clearBuffer[0] = 255
+  b.clear(0, clearBuffer) // clear first byte
+  t.absent(b.get(7), 'cleared bit')
+  t.ok(b.get(10), 'cleared only first byte')
+})
+
+test('setRange w/ false doesnt make new pages', function (t) {
+  const b = new RemoteBitfield()
+
+  t.is(b._maxSegments, 0, 'max seen page starts as 0')
+  const start = Date.now()
+  b.setRange(1, 2 ** 42 - 1, false)
+  t.is(b._maxSegments, 0, 'max seen page still zero')
+  const delta = Date.now() - start
+  t.comment('delta for setRange w/ false beyond bitfield', delta)
+  t.ok(delta < 100, 'was "fast" (< 100ms)')
+
+  b.setRange(0, 10, true)
+  t.is(b._maxSegments, 1, '_maxSegments increments when adding a page')
+  b.setRange(2097152, 2097153, true)
+  t.is(b._maxSegments, 2, '_maxSegments increments when adding a page')
+})
+
+test('remote congituous length consistency (remote-bitfield findFirst edge case)', async function (t) {
+  // Indirectly tests the findFirst method for the case where
+  // a position > 0 is passed in, while _maxSegments is still 0
+  // because nothing was set.
+  const a = await create(t)
+  const b = await create(t, a.key)
+  const c = await create(t, a.key)
+
+  replicate(a, b, t)
+  replicate(b, c, t)
+
+  await a.append('block0')
+  await a.append('block1')
+
+  await b.get(0)
+  await new Promise((resolve) => setTimeout(resolve, 500))
+
+  const peer = getPeer(c, b)
+
+  t.is(peer._remoteContiguousLength, 1, 'Sanity check')
+
+  t.is(
+    peer._remoteContiguousLength <= peer.remoteContiguousLength,
+    true,
+    'invariant holds: remoteContiguousLength at least _remoteContiguousLength'
+  )
+})
+
+test('bitfield extends remote contiguous length', async function (t) {
+  const a = await create(t)
+  const b = await create(t, a.key)
+
+  await a.append(new Array(35).fill('a'))
+
+  replicate(a, b, t)
+  await b.download({ start: 0, end: 35 }).done()
+
+  const peer = getPeer(b, a)
+
+  peer.onbitfield({ start: 32, bitfield: new Uint32Array([0b111]) })
+  t.is(peer._remoteContiguousLength, 35)
+
+  const tx = peer.stats.wireRange.tx
+  peer.broadcastRange(0, 35, false)
+  t.is(peer.stats.wireRange.tx, tx, 'range not sent')
+})
+
+test('ranges extend remote contiguous length', async function (t) {
+  const a = await create(t)
+  const b = await create(t, a.key)
+
+  replicate(a, b, t)
+  await eventFlush()
+
+  const peer = getPeer(b, a)
+
+  await peer.onrange({ drop: false, start: 1, length: 1023 })
+  await peer.onrange({ drop: false, start: 0, length: 1 })
+
+  t.is(peer._remoteContiguousLength, 1024)
+  t.is(b.core.header.hints.remoteContiguousLength, 1)
+
+  await peer.onrange({ drop: false, start: 0, length: 1024 })
+
+  t.is(b.core.header.hints.remoteContiguousLength, 1024)
+
+  await peer.onrange({ drop: false, start: 2048, length: 1024 })
+  await peer.onrange({ drop: false, start: 1024, length: 1024 })
+
+  t.is(peer._remoteContiguousLength, 3072)
+})
+
+test('remote contiguous length past the last bitfield page', async function (t) {
+  const a = await create(t)
+  const b = await create(t, a.key)
+
+  replicate(a, b, t)
+  await eventFlush()
+
+  const peer = getPeer(b, a)
+
+  await peer.onrange({ drop: false, start: 5, length: 1 })
+  await peer.onrange({ drop: false, start: 0, length: 100000 })
+
+  t.is(peer._remoteContiguousLength, 100000)
+
+  peer.onbitfield({ start: 2 ** 21, bitfield: new Uint32Array([1]) })
+
+  t.is(peer._remoteContiguousLength, 100000)
+})
+
+test('bitfield messages sent on cache miss', async function (t) {
+  const original = await create(t)
+  const sparse = await create(t, original.key)
+  const empty = await create(t, original.key)
+
+  await original.append(['a', 'b', 'c', 'd', 'e'])
+
+  replicate(original, sparse, t)
+  await original.get(2)
+  await original.get(3)
+
+  replicate(sparse, empty, t)
+  await new Promise((resolve) => setTimeout(resolve, 1000))
+
+  t.is(empty.replicator.peers.length, 1, 'Sanity check')
+  const stats = empty.replicator.peers[0].stats
+  t.is(stats.wireBitfield.rx, 0, 'initially no bitfields sent (sanity check')
+
+  await t.exception(
+    async () => {
+      await empty.get(1, { timeout: 100 })
+    },
+    /REQUEST_TIMEOUT/,
+    'request on unavailable block times out (sanity check)'
+  )
+  t.is(stats.wireBitfield.rx, 1, 'Requests bitfield on cache miss')
+})
+
+// Peer b as seen by peer a (b is the remote peer)
+function getPeer(a, b) {
+  for (const aPeer of a.core.replicator.peers) {
+    for (const bPeer of b.core.replicator.peers) {
+      if (b4a.equals(aPeer.stream.remotePublicKey, bPeer.stream.publicKey)) {
+        return aPeer
+      }
+    }
+  }
+
+  throw new Error('Error in test: peer not found')
+}
